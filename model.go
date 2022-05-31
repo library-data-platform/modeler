@@ -67,6 +67,43 @@ func (m *Model) EncodeDOT() string {
 	return b.String()
 }
 
+func (m *Model) EncodeSQL() string {
+	var b strings.Builder
+	var targetTables = make(map[string]string)
+	var r reference
+	for _, r = range m.refs {
+		var ok bool
+		var s string
+		s, ok = targetTables[r.TargetTable]
+		if ok {
+			if s != r.TargetColumn {
+				panic(fmt.Sprintf("modeler: target table columns do not match: %s != %s", s, r.TargetColumn))
+			}
+		} else {
+			targetTables[r.TargetTable] = r.TargetColumn
+		}
+	}
+	var k, v string
+	for k = range targetTables {
+		b.WriteString("ALTER TABLE " + k + " DROP CONSTRAINT " + tableOnly(k) + "_pkey;\n")
+	}
+	for k, v = range targetTables {
+		b.WriteString("ALTER TABLE " + k + " ADD PRIMARY KEY (\"" + v + "\");\n")
+	}
+	for _, r = range m.refs {
+		b.WriteString("ALTER TABLE " + r.SourceTable + " ADD FOREIGN KEY (\"" + r.SourceColumn + "\") REFERENCES " + r.TargetTable + " (\"" + r.TargetColumn + "\");\n")
+	}
+	return b.String()
+}
+
+func tableOnly(schemaTable string) string {
+	var sp = strings.Split(schemaTable, ".")
+	if len(sp) != 2 {
+		panic(fmt.Sprintf("modeler: invalid table name: %s", schemaTable))
+	}
+	return sp[1]
+}
+
 func getTableList(dbc *dbconn) ([]tableschema, error) {
 	var err error
 	var tables []tableschema
