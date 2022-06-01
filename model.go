@@ -2,10 +2,10 @@ package modeler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
-	"regexp"
 	"strings"
 
 	"github.com/jackc/pgx/v4"
@@ -114,7 +114,6 @@ func getTableList(dbc *dbconn) ([]tableschema, error) {
 	var i int
 	var t tableschema
 	for i, t = range tables {
-		// fmt.Fprintf(os.Stderr, "%s.%s\n", t.SchemaName, t.TableName)
 		var columns []columnschema
 		if columns, err = getColumnList(dbc, t.SchemaName, t.TableName); err != nil {
 			return nil, fmt.Errorf("selecting column list: %v", err)
@@ -131,7 +130,7 @@ func getTableList(dbc *dbconn) ([]tableschema, error) {
 func selectTableList(dbc *dbconn) ([]tableschema, error) {
 	var err error
 	// Read table schemas.
-	var q = "SELECT schemaname, tablename FROM metadb.track WHERE tablename LIKE '%\\_\\_t' ORDER BY schemaname, tablename"
+	var q = "SELECT schemaname, tablename FROM metadb.track WHERE tablename NOT LIKE '%\\_\\_t' ORDER BY schemaname, tablename"
 	var rows pgx.Rows
 	if rows, err = dbc.Conn.Query(context.TODO(), q); err != nil {
 		return nil, fmt.Errorf("executing query: %v", err)
@@ -151,7 +150,35 @@ func selectTableList(dbc *dbconn) ([]tableschema, error) {
 	if rows.Err() != nil {
 		return nil, fmt.Errorf("scanning results: %v", rows.Err())
 	}
+	// Use transformed table where possible.
+	var i int
+	var t tableschema
+	for i, t = range tables {
+		t.TableName = t.TableName + "__t"
+		var found bool
+		if found, err = tableExists(dbc, t.SchemaName, t.TableName); err != nil {
+			return nil, fmt.Errorf("checking for transformed table: %s.%s: %v", t.SchemaName, t.TableName, rows.Err())
+		}
+		if found {
+			tables[i] = t
+		}
+	}
 	return tables, nil
+}
+
+func tableExists(dbc *dbconn, schema, table string) (bool, error) {
+	var err error
+	var q = "SELECT 1 FROM metadb.track WHERE schemaname=$1 AND tablename=$2"
+	var n int32
+	err = dbc.Conn.QueryRow(context.TODO(), q, schema, table).Scan(&n)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, err
+	default:
+		return true, nil
+	}
 }
 
 func getColumnList(dbc *dbconn, schema, table string) ([]columnschema, error) {
@@ -163,14 +190,9 @@ func getColumnList(dbc *dbconn, schema, table string) ([]columnschema, error) {
 	var i int
 	var c columnschema
 	for i, c = range columns {
-		// var k bool
-		// if k, err = isKey(dbc, schema, table, c.Name); err != nil {
-		// 	return nil, fmt.Errorf("checking for key: %v", err)
-		// }
 		columns[i] = columnschema{
 			Name: c.Name,
 			Num:  c.Num,
-			// Key:  k,
 		}
 	}
 	return columns, nil
@@ -179,7 +201,7 @@ func getColumnList(dbc *dbconn, schema, table string) ([]columnschema, error) {
 func selectColumnList(dbc *dbconn, schema, table string) ([]columnschema, error) {
 	var err error
 	// Read column schemas.
-	var q = "SELECT a.attname, a.attnum FROM pg_class c JOIN pg_namespace n ON c.relnamespace=n.oid JOIN pg_attribute a ON c.oid=a.attrelid WHERE n.nspname='" + schema + "' AND c.relname='" + table + "' AND a.attnum > 0 ORDER BY a.attnum"
+	var q = "SELECT a.attname, a.attnum FROM pg_class c JOIN pg_namespace n ON c.relnamespace=n.oid JOIN pg_attribute a ON c.oid=a.attrelid JOIN pg_type t ON a.atttypid=t.oid WHERE n.nspname='" + schema + "' AND c.relname='" + table + "' AND a.attnum > 0 AND t.typname='uuid' ORDER BY a.attnum"
 	var rows pgx.Rows
 	if rows, err = dbc.Conn.Query(context.TODO(), q); err != nil {
 		return nil, fmt.Errorf("executing query: %v", err)
@@ -206,34 +228,12 @@ func selectColumnList(dbc *dbconn, schema, table string) ([]columnschema, error)
 	return columns, nil
 }
 
-func isKey(dbc *dbconn, schema, table, column string) (bool, error) {
-	var err error
-	var q = "SELECT 1 FROM " + schema + "." + table + " GROUP BY \"" + column + "\" HAVING count(*) > 1 LIMIT 1"
-	var n int64
-	err = dbc.Conn.QueryRow(context.TODO(), q).Scan(&n)
-	switch {
-	case err == pgx.ErrNoRows:
-		return true, nil
-	case err != nil:
-		return false, err
-	default:
-		return false, nil
-	}
-}
-
 func searchTableForeignKeys(dbc *dbconn, tables []tableschema, table tableschema, refs *[]reference) error {
 	var err error
 	var tablestr = table.SchemaName + "." + table.TableName
 	var c columnschema
 	for _, c = range table.Columns {
 		if c.Num == 6 {
-			continue
-		}
-		var sample string
-		if sample, err = getSampleData(dbc, table.SchemaName, table.TableName, c.Name); err != nil {
-			return fmt.Errorf("reading sample data: %v", err)
-		}
-		if !isUUID(sample) {
 			continue
 		}
 		var t1 tableschema
@@ -269,26 +269,23 @@ func searchTableForeignKeys(dbc *dbconn, tables []tableschema, table tableschema
 func isForeignKey(dbc *dbconn, table2 string, column2 string, table1 string, column1 columnschema) (bool, error) {
 	var err error
 	var e bool
-	if e, err = isTableEmpty(dbc, table2); err != nil {
+	if e, err = isColumnEmpty(dbc, table2, column2); err != nil {
 		return false, fmt.Errorf("checking for empty table: %v: %v", table2, err)
 	}
 	if e {
 		return false, nil
 	}
-	if e, err = isTableEmpty(dbc, table1); err != nil {
+	if e, err = isColumnEmpty(dbc, table1, column1.Name); err != nil {
 		return false, fmt.Errorf("checking for empty table: %v: %v", table1, err)
 	}
 	if e {
 		return false, nil
 	}
-	// if !column1.Key {
-	// 	return false, nil
-	// }
 	var q = "SELECT 1 FROM " + table2 + " r2 LEFT JOIN " + table1 + " r1 ON r2." + column2 + "=r1." + column1.Name + " WHERE r2." + column2 + " IS NOT NULL AND r1." + column1.Name + " IS NULL LIMIT 1"
-	var n int64
+	var n int32
 	err = dbc.Conn.QueryRow(context.TODO(), q).Scan(&n)
 	switch {
-	case err == pgx.ErrNoRows:
+	case errors.Is(err, pgx.ErrNoRows):
 		return true, nil
 	case err != nil:
 		return true, nil
@@ -297,37 +294,18 @@ func isForeignKey(dbc *dbconn, table2 string, column2 string, table1 string, col
 	}
 }
 
-func isTableEmpty(dbc *dbconn, table string) (bool, error) {
+func isColumnEmpty(dbc *dbconn, table, column string) (bool, error) {
 	var err error
-	var q = "SELECT 1 FROM " + table + " LIMIT 1"
-	var n int64
+	var q = "SELECT 1 FROM " + table + " WHERE \"" + column + "\" IS NOT NULL LIMIT 1"
+	var n int32
 	err = dbc.Conn.QueryRow(context.TODO(), q).Scan(&n)
 	switch {
-	case err == pgx.ErrNoRows:
+	case errors.Is(err, pgx.ErrNoRows):
 		return true, nil
 	case err != nil:
 		return false, err
 	default:
 		return false, nil
-	}
-}
-
-func getSampleData(dbc *dbconn, schema, table, column string) (string, error) {
-	var err error
-	var q = "SELECT \"" + column + "\"::text FROM " + schema + "." + table + " LIMIT 1"
-	var d *string
-	err = dbc.Conn.QueryRow(context.TODO(), q).Scan(&d)
-	switch {
-	case err == pgx.ErrNoRows:
-		return "", nil
-	case err != nil:
-		return "", err
-	default:
-		if d == nil {
-			return "", nil
-		} else {
-			return *d, nil
-		}
 	}
 }
 
@@ -351,15 +329,10 @@ func (t tableschema) String() string {
 type columnschema struct {
 	Name string
 	Num  int16
-	Key  bool
 }
 
 func (c columnschema) String() string {
-	if c.Key {
-		return c.Name + "*"
-	} else {
-		return c.Name
-	}
+	return c.Name
 }
 
 type reference struct {
@@ -377,9 +350,3 @@ type dbconn struct {
 	Conn       *pgx.Conn
 	ConnString string
 }
-
-func isUUID(str string) bool {
-	return uuidRegexp.MatchString(str)
-}
-
-var uuidRegexp = regexp.MustCompile(`^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$`)
